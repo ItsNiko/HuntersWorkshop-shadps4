@@ -55,23 +55,26 @@ namespace HuntersWorkshop {
         // shadPS4 maps the guest address space itself (not as a private image allocation), so
         // locate the eboot by finding the verified Give prologue and checking Create at its fixed
         // distance. Both functions come from the same decrypted 1.09 executable.
+        long scanBytes,scanHits,scanRegions,scanReadFails;
         long ScanForImage(bool executableOnly) {
-            long at=0x10000; byte[] needle=givePro; const int chunk=4*1024*1024;
+            scanBytes=0; scanHits=0; scanRegions=0; scanReadFails=0;
+            long at=0x10000; byte[] needle=givePro; const int chunk=1024*1024;
             while(at<0x7ffffffeffff) {
                 Native.Region r;
                 if(Native.VirtualQueryEx(m.Handle,new IntPtr(at),out r,(UIntPtr)48)==UIntPtr.Zero || r.Size==0) break;
                 bool readable=r.State==0x1000 && (r.Protect&0x101)==0 && r.Protect!=0;
                 bool exec=(r.Protect&0xf0)!=0;
                 if(readable && (exec || !executableOnly) && r.Size>=0x10000 && r.Size<=0x80000000UL) {
-                    long start=r.Base,end=r.Base+(long)r.Size;
+                    long start=r.Base,end=r.Base+(long)r.Size; scanRegions++;
                     for(long off=start;off<end;off+=chunk-needle.Length) {
                         int n=(int)Math.Min(chunk,end-off); if(n<needle.Length) break;
-                        byte[] buf; try { buf=m.Read(off,n); } catch { break; }
+                        byte[] buf; try { buf=m.Read(off,n); } catch { scanReadFails++; break; }
+                        scanBytes+=n;
                         int i=0;
                         while((i=Array.IndexOf(buf,needle[0],i))>=0 && i<=buf.Length-needle.Length) {
                             bool same=true; for(int k=1;k<needle.Length;k++) if(buf[i+k]!=needle[k]) { same=false; break; }
                             if(same) {
-                                long candidate=off+i-Commands.Give;
+                                scanHits++; long candidate=off+i-Commands.Give;
                                 if(candidate>0x10000 && Match(candidate+Commands.Create,createPro)) return candidate;
                             }
                             i++;
@@ -84,7 +87,8 @@ namespace HuntersWorkshop {
         }
         long FindShadImage() {
             long found=ScanForImage(true); if(found==0) found=ScanForImage(false);
-            if(found==0) throw new InvalidOperationException("Bloodborne CUSA03173 1.09 was not found in shadPS4. Start the game, wait for the title screen, and try again. Only CUSA03173 v01.09 is supported.");
+            if(found==0) Log("shadPS4 scan: no match. regions="+scanRegions+" MB="+(scanBytes>>20)+" givePrologueHits="+scanHits+" readFailures="+scanReadFails);
+            if(found==0) throw new InvalidOperationException("Bloodborne CUSA03173 1.09 was not found in shadPS4 (scanned "+(scanBytes>>20)+" MB, "+scanHits+" function hits). Start the game, wait for the title screen, and try again. Only CUSA03173 v01.09 is supported.");
             return found;
         }
         long FindImage() {
@@ -109,12 +113,13 @@ namespace HuntersWorkshop {
                 // No native port is running: look for a shadPS4 emulator hosting the game.
                 var emu=ShadProcessNames.SelectMany(n=>Process.GetProcessesByName(n)).Where(x=>specificPid==0 || x.Id==specificPid).ToArray();
                 if(emu.Length==0) throw new InvalidOperationException("Start Bloodborne (native port or shadPS4), then connect.");
-                var hosts=new List<Process>();
+                var hosts=new List<Process>(); bool denied=false;
                 foreach(var e in emu) {
                     try {
                         using(var probe=new Memory(Process.GetProcessById(e.Id))) { var saved=m; m=probe; try { if(FindShadImage()!=0) hosts.Add(e); } catch(InvalidOperationException) { } finally { m=saved; } }
-                    } catch(System.ComponentModel.Win32Exception) { }
+                    } catch(System.ComponentModel.Win32Exception ex) { Log("Cannot open shadPS4 PID "+e.Id+": "+ex.Message); denied=true; } catch(ArgumentException) { }
                 }
+                if(hosts.Count==0 && denied) throw new InvalidOperationException("Windows would not let the Workshop open shadPS4. Run both as the same user, or run the Workshop as administrator if shadPS4 is elevated.");
                 if(hosts.Count!=1) throw new InvalidOperationException(hosts.Count==0
                     ? "shadPS4 is running but Bloodborne CUSA03173 1.09 was not found in it. Start the game and wait for the title screen."
                     : "Several shadPS4 instances are running Bloodborne. Close the extra instance first.");
