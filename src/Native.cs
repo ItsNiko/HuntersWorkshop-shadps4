@@ -27,11 +27,14 @@ namespace HuntersWorkshop {
         }
         internal static Exception Error(string op) { return new Win32Exception(Marshal.GetLastWin32Error(),op); }
     }
+
+    // Read/write access to the shadPS4 process plus the one operation that needs care: replacing
+    // game code while every thread is stopped.
     public sealed class Memory : IDisposable {
-        internal IntPtr Handle; internal readonly Process Process;
+        internal IntPtr Handle; internal readonly Process Host;
         internal Memory(Process p) {
-            Process=p; Handle=Native.OpenProcess(0xC38,false,p.Id); // query/read/write/VM operation + suspend; no remote-thread access
-            if(Handle==IntPtr.Zero) throw Native.Error("Cannot open Bloodborne");
+            Host=p; Handle=Native.OpenProcess(0xC38,false,p.Id); // query/read/write/VM operation + suspend; no remote-thread access
+            if(Handle==IntPtr.Zero) throw Native.Error("Cannot open shadPS4");
         }
         public byte[] Read(long at,int size) {
             if(at<0x10000 || size<1 || size>1048576) throw new InvalidOperationException("Invalid memory range.");
@@ -52,9 +55,9 @@ namespace HuntersWorkshop {
             finally { uint ignored; if(!Native.VirtualProtectEx(Handle,new IntPtr(at),(UIntPtr)(uint)b.Length,old,out ignored)) throw Native.Error("Cannot restore hook page protection"); }
         }
         internal void Free(long at) { if(at!=0 && !Native.VirtualFreeEx(Handle,new IntPtr(at),UIntPtr.Zero,0x8000)) throw Native.Error("Cannot release unused command memory"); }
-        internal long AllocateNear(long site) {
-            // The port reserves its low guest arena with Windows placeholders. Use an
-            // independent allocation and a full absolute jump; never commit its placeholders.
+        // Independent allocation in shadPS4's own address space. The bridge is reached through an
+        // absolute jump, so it does not need to sit near the game image.
+        internal long Allocate() {
             var p=Native.VirtualAllocEx(Handle,IntPtr.Zero,(UIntPtr)8192,0x3000,4);
             if(p==IntPtr.Zero) throw Native.Error("Cannot allocate the main-thread command bridge");
             return p.ToInt64();
@@ -64,36 +67,51 @@ namespace HuntersWorkshop {
             try { if(I(data)!=1)return false;Write(data,BitConverter.GetBytes(0));return true; }
             finally { if(Native.NtResumeProcess(Handle)!=0) throw new InvalidOperationException("Cannot resume the game."); }
         }
-        // All game threads are stopped for instruction replacement. Refuse a thread whose
-        // RIP is inside the bytes being replaced; never translate an in-flight instruction.
+
+        // Instruction pointer of one thread (the process must be suspended), or -1 when the thread
+        // cannot be opened or read.
+        static long ThreadRip(int id) {
+            IntPtr th=Native.OpenThread(0x48,false,id);
+            if(th==IntPtr.Zero) return -1;
+            IntPtr raw=Marshal.AllocHGlobal(1232+16);
+            try {
+                var ctx=new IntPtr((raw.ToInt64()+15)&~15L);
+                Marshal.Copy(new byte[1232],0,ctx,1232); Marshal.WriteInt32(ctx,48,0x100001);
+                return Native.GetThreadContext(th,ctx)?Marshal.ReadInt64(ctx,248):-1;
+            } finally { Marshal.FreeHGlobal(raw); Native.CloseHandle(th); }
+        }
+        // True when some thread is executing inside [lo,hi). The thread list is taken fresh every
+        // time: shadPS4 starts and ends helper threads constantly, and a thread that has gone or
+        // cannot be read is not a game thread parked inside our bytes, so it is skipped.
+        bool AnyThreadInside(long lo,long hi) {
+            Process fresh;
+            try { fresh=Process.GetProcessById(Host.Id); }
+            catch(ArgumentException) { throw new InvalidOperationException("shadPS4 closed while the Workshop was attaching."); }
+            using(fresh) {
+                foreach(ProcessThread t in fresh.Threads) {
+                    long rip=ThreadRip(t.Id);
+                    if(rip>=lo && rip<hi) return true;
+                }
+            }
+            return false;
+        }
+        // All game threads are stopped for instruction replacement. Retry while a thread sits inside
+        // the bytes being replaced; never translate an in-flight instruction.
         internal void PausedPatch(long at,byte[] expected,byte[] replacement) {
-            for(int attempt=0;attempt<20;attempt++) {
-                bool retry=false;
+            for(int attempt=0;attempt<50;attempt++) {
                 if(Native.NtSuspendProcess(Handle)!=0) throw new InvalidOperationException("Cannot suspend game threads for the hook.");
                 try {
-                    foreach(ProcessThread t in Process.Threads) {
-                        IntPtr th=Native.OpenThread(0x48,false,t.Id);
-                        if(th==IntPtr.Zero) throw Native.Error("Cannot inspect a game thread");
-                        IntPtr raw=Marshal.AllocHGlobal(1250);
-                        try {
-                            var ctx=new IntPtr((raw.ToInt64()+15)&~15L);
-                            Marshal.Copy(new byte[1232],0,ctx,1232); Marshal.WriteInt32(ctx,48,0x100001);
-                            if(!Native.GetThreadContext(th,ctx)) throw Native.Error("Cannot inspect game instruction pointer");
-                            long rip=Marshal.ReadInt64(ctx,248);
-                            if(rip>=at && rip<at+expected.Length) retry=true;
-                        } finally { Marshal.FreeHGlobal(raw); Native.CloseHandle(th); }
-                    }
-                    if(!retry) {
+                    if(!AnyThreadInside(at,at+expected.Length)) {
                         if(!Read(at,expected.Length).SequenceEqual(expected)) throw new InvalidOperationException("The game hook changed. Restart the game before connecting again.");
                         try { Code(at,replacement); }
                         catch { Code(at,expected); throw; }
                         return;
                     }
                 } finally { if(Native.NtResumeProcess(Handle)!=0) throw new InvalidOperationException("Cannot resume the game."); }
-                Thread.Sleep(10);
+                Thread.Sleep(5);
             }
-            throw new InvalidOperationException("Game code is busy. Try connecting again while idle.");
+            throw new InvalidOperationException("Game code is busy. Try connecting again.");
         }
-        public void Dispose() { if(Handle!=IntPtr.Zero) { Native.CloseHandle(Handle); Handle=IntPtr.Zero; } Process.Dispose(); }
+        public void Dispose() { if(Handle!=IntPtr.Zero) { Native.CloseHandle(Handle); Handle=IntPtr.Zero; } Host.Dispose(); }
     }
 }

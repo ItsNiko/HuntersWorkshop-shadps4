@@ -31,7 +31,6 @@ namespace HuntersWorkshop
 
     public sealed class App : Application
     {
-        public const string RepositoryUrl = "https://github.com/SpetsTheWise/bloodborne-hunters-workshop";
         Catalog catalog;
         Preferences preferences;
         Engine engine;
@@ -57,36 +56,22 @@ namespace HuntersWorkshop
             bool ownsInstance = false;
             try
             {
-                if (args.Length > 0 && args[0] == "--self-test")
-                    return SelfTests.Run(args.Length > 1 ? args[1] : Path.Combine(Storage.Root, "tests"));
-                if (args.Length > 0 && args[0] == "--probe") return SelfTests.Probe(args);
-                if (args.Length > 0 && args[0] == "--ui-test")
-                    Environment.SetEnvironmentVariable("HUNTERS_WORKSHOP_DATA", Path.Combine(Path.GetFullPath(args.Length > 1 ? args[1] : "test-output"), "test-data"));
-                else
+                instance = new Mutex(false, "Local\\HuntersWorkshopDesktop-0.3");
+                try { ownsInstance = instance.WaitOne(0); }
+                catch (AbandonedMutexException) { ownsInstance = true; }
+                if (!ownsInstance)
                 {
-                    instance = new Mutex(false, "Local\\HuntersWorkshopDesktop-0.2");
-                    try { ownsInstance = instance.WaitOne(0); }
-                    catch (AbandonedMutexException) { ownsInstance = true; }
-                    if (!ownsInstance)
-                    {
-                        MessageBox.Show("Hunter's Workshop is already open. Use its existing window.", "Hunter's Workshop");
-                        return 0;
-                    }
+                    MessageBox.Show("Hunter's Workshop is already open. Use its existing window.", "Hunter's Workshop");
+                    return 0;
                 }
                 var app = new App();
-                app.Startup += (s, e) => app.Start(args);
+                app.Startup += (s, e) => app.Start();
                 return app.Run();
             }
             catch (Exception ex)
             {
                 Storage.Log("Fatal: " + ex);
-                if (args.Length == 0) MessageBox.Show(ex.Message, "Hunter's Workshop");
-                else
-                {
-                    string destination = args[0] == "--probe" && args.Length > 2 ? args[2] + ".error.txt" : Path.Combine(Storage.Root, "error.txt");
-                    try { Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(destination))); File.WriteAllText(destination, ex.ToString()); }
-                    catch (IOException) { }
-                }
+                MessageBox.Show(ex.Message, "Hunter's Workshop");
                 return 1;
             }
             finally
@@ -110,13 +95,13 @@ namespace HuntersWorkshop
             }
         }
 
-        void Start(string[] args)
+        void Start()
         {
             using (var stream = typeof(App).Assembly.GetManifestResourceStream("Theme.xaml"))
                 Resources = (ResourceDictionary)XamlReader.Load(stream);
             catalog = Catalog.Read<Catalog>("catalog.json");
             preferences = Storage.Load();
-            engine = new Engine(Catalog.Read<Profile>("profile.json"), catalog) { UserPath = preferences.UserDirectory };
+            engine = new Engine(catalog) { UserPath = preferences.UserDirectory };
             orderedEffects = catalog.Effects.OrderBy(x => x.Name).ThenByDescending(x => x.Rating).ThenBy(x => x.Id).ToArray();
             using (var stream = typeof(App).Assembly.GetManifestResourceStream("Main.xaml")) window = (Window)XamlReader.Load(stream);
             window.Icon = Bitmap("HuntersWorkshop.ico");
@@ -129,7 +114,6 @@ namespace HuntersWorkshop
             C<Button>("Minimize").Click += (s, e) => window.WindowState = WindowState.Minimized;
             C<Button>("Maximize").Click += (s, e) => window.WindowState = window.WindowState == WindowState.Maximized ? WindowState.Normal : WindowState.Maximized;
             C<Button>("Close").Click += (s, e) => window.Close();
-            C<Button>("GitHub").Click += (s, e) => Open(RepositoryUrl);
             C<ComboBox>("Category").ItemsSource = new[] { "All categories", "Weapons", "Armor", "Items", "Accessories (advanced)" };
             C<ComboBox>("Category").SelectedIndex = 0;
             C<ComboBox>("Variant").ItemsSource = new[] { "All variants", "Standard", "Uncanny", "Lost" };
@@ -161,15 +145,15 @@ namespace HuntersWorkshop
             C<Button>("Less").Click += (s, e) => StepQuantity(-1);
             C<Button>("More").Click += (s, e) => StepQuantity(1);
             C<TextBox>("Quantity").TextChanged += (s, e) => { if (!busy) Refresh(); };
-            C<Button>("Connect").Click += async (s, e) => await RunOperation("Connecting to Bloodborne (bbport or shadPS4)…", () =>
+            C<Button>("Connect").Click += async (s, e) => await RunOperation("Connecting to shadPS4…", () =>
             {
                 if (engine.Connected) { engine.Dispose(); return Task.FromResult("Disconnected. Inventory changes remain in your save."); }
                 engine.Connect();
-                preferences.PortDirectory = engine.PortPath;
+                preferences.ShadDirectory = engine.ShadPath;
                 preferences.UserDirectory = engine.UserPath;
                 try { Storage.Save(preferences); }
-                catch (IOException ex) { Storage.Log("Could not save the detected port folder: " + ex.Message); }
-                catch (UnauthorizedAccessException ex) { Storage.Log("Could not save the detected port folder: " + ex.Message); }
+                catch (IOException ex) { Storage.Log("Could not save the detected shadPS4 folder: " + ex.Message); }
+                catch (UnauthorizedAccessException ex) { Storage.Log("Could not save the detected shadPS4 folder: " + ex.Message); }
                 return Task.FromResult("Connected. Wait for Hunter ready, then choose your item or gem.");
             });
             C<Button>("Backup").Click += async (s, e) => await RunOperation("Creating and verifying your save snapshot…", () => Task.FromResult("Save snapshot verified: " + engine.Backup()));
@@ -214,8 +198,6 @@ namespace HuntersWorkshop
             timer.Tick += (s, e) => { if (!busy) Refresh(); };
             timer.Start();
             window.Show();
-            if (args.Length > 0 && args[0] == "--ui-test")
-                window.Dispatcher.BeginInvoke(new Action(async () => await UiTests(args.Length > 1 ? args[1] : "test-output")), DispatcherPriority.ApplicationIdle);
         }
 
         void BuildSlots()
@@ -415,15 +397,15 @@ namespace HuntersWorkshop
 
         void BrowsePort()
         {
-            if (engine.Connected) { Notify("Disconnect before changing the port folder."); return; }
-            using (var dialog = new System.Windows.Forms.FolderBrowserDialog { Description = "Select the native port folder (contains out\\bbport.exe) or the shadPS4 folder (contains shadPS4.exe)", SelectedPath = preferences.PortDirectory ?? "", ShowNewFolderButton = false })
+            if (engine.Connected) { Notify("Disconnect before changing the shadPS4 folder."); return; }
+            using (var dialog = new System.Windows.Forms.FolderBrowserDialog { Description = "Select the shadPS4 folder (the one that contains shadPS4.exe)", SelectedPath = preferences.ShadDirectory ?? "", ShowNewFolderButton = false })
             {
                 if (dialog.ShowDialog() != System.Windows.Forms.DialogResult.OK) return;
                 try
                 {
-                    engine.ConfigurePort(dialog.SelectedPath);
-                    preferences.PortDirectory = engine.PortPath; preferences.UserDirectory = null; Persist(); Refresh();
-                    Notify("Port folder selected. You can now back up saves while the game is closed.");
+                    engine.SetFolder(dialog.SelectedPath);
+                    preferences.ShadDirectory = engine.ShadPath; preferences.UserDirectory = engine.UserPath; Persist(); Refresh();
+                    Notify("shadPS4 folder selected. You can now back up saves while the game is closed.");
                 }
                 catch (Exception ex) { Notify(ex.Message, true); }
             }
@@ -490,68 +472,9 @@ namespace HuntersWorkshop
             bool gemValid = effects[0] >= 0;
             C<Button>("GiveGem").IsEnabled = snapshot.Ready && !busy && gemValid;
             C<Button>("UseEffect").IsEnabled = C<DataGrid>("EffectGrid").SelectedItem != null;
-            C<TextBox>("PortPath").Text = engine.PortPath ?? "";
-            C<TextBlock>("SavePath").Text = String.IsNullOrWhiteSpace(engine.UserPath) ? "Saves are detected from the running game's launch arguments." : "Save directory: " + engine.UserPath;
+            C<TextBox>("PortPath").Text = engine.ShadPath ?? "";
+            C<TextBlock>("SavePath").Text = String.IsNullOrWhiteSpace(engine.UserPath) ? "Saves are found in shadPS4's user folder (portable \"user\" folder, or %APPDATA%\\shadPS4\\user)." : "Save directory: " + engine.UserPath;
             if (engine.LastBackup != null) C<TextBlock>("BackupStatus").Text = "Automatic snapshot verified for this character.";
-        }
-
-        void Capture(string path)
-        {
-            window.UpdateLayout();
-            var image = new RenderTargetBitmap((int)window.ActualWidth, (int)window.ActualHeight, 96, 96, PixelFormats.Pbgra32);
-            image.Render(window);
-            var encoder = new PngBitmapEncoder(); encoder.Frames.Add(BitmapFrame.Create(image));
-            using (var output = File.Create(path)) encoder.Save(output);
-        }
-
-        async Task UiTests(string directory)
-        {
-            Directory.CreateDirectory(directory);
-            int checks = 0;
-            Action<bool, string> check = (ok, message) => { if (!ok) throw new Exception(message); checks++; };
-            try
-            {
-                check(!C<Button>("GiveItem").IsEnabled, "Disconnected item grant must be disabled.");
-                C<TextBox>("ItemSearch").Text = "lost chikage";
-                check(C<DataGrid>("ItemGrid").Items.Count == 1, "Multiword item search.");
-                check(((UpgradeChoice)C<ComboBox>("Upgrade").Items[10]).Value == 10, "+10 reinforcement selection.");
-                if (!preferences.Favorites.Contains(ItemKey(SelectedItem))) Favorite();
-                C<ComboBox>("Upgrade").SelectedIndex = 10; Navigate(0, true);
-                check(C<DataGrid>("ItemGrid").Items.Count == 1, "Favorites filter.");
-                Navigate(0, false);
-                C<ComboBox>("Upgrade").SelectedIndex = 10;
-                await Task.Delay(350); Capture(Path.Combine(directory, "items.png"));
-                Navigate(1, false); C<TextBox>("EffectSearch").Text = "physical 27.2";
-                check(C<DataGrid>("EffectGrid").Items.Count > 0, "Multiword gem search.");
-                C<DataGrid>("EffectGrid").SelectedIndex = 0; AssignEffect();
-                check(effects[0] >= 0, "Primary effect assigned.");
-                C<ComboBox>("TargetSlot").SelectedIndex = 2; AssignEffect();
-                check(effects[2] >= 0 && effects[1] == -1, "Chosen secondary slot assigned independently.");
-                for (int i = 1; i < 6; i++) effects[i] = -1;
-                UpdateSlots(); check(effects[0] >= 0, "Clear extras preserves primary.");
-                C<ComboBox>("Shape").SelectedIndex = 4;
-                await Task.Delay(350); Capture(Path.Combine(directory, "gems.png"));
-                var bounds = C<Button>("GiveGem").TransformToAncestor(window).TransformBounds(new Rect(C<Button>("GiveGem").RenderSize));
-                check(bounds.Bottom < window.ActualHeight && bounds.Top > 0, "Create button stays within window.");
-                window.Width = 1120; window.Height = 780; await Task.Delay(350);
-                Capture(Path.Combine(directory, "compact.png"));
-                bounds = C<Button>("GiveGem").TransformToAncestor(window).TransformBounds(new Rect(C<Button>("GiveGem").RenderSize));
-                check(bounds.Bottom < window.ActualHeight, "Compact create button stays visible.");
-                C<ComboBox>("GemKind").SelectedIndex = 1; C<TextBox>("EffectSearch").Text = "moon";
-                check(C<DataGrid>("EffectGrid").Items.Count == 3 && effects.All(n => n == -1), "Rune mode clears gems and finds Moon tiers.");
-                C<TextBox>("EffectSearch").Text = "no such effect 123456789";
-                check(C<TextBlock>("NoEffects").Visibility == Visibility.Visible, "Empty-state guidance.");
-                window.Width = 1390; window.Height = 930; Navigate(2, false); await Task.Delay(350);
-                Capture(Path.Combine(directory, "session.png"));
-                check(Storage.Load().Favorites.Count > 0, "Preferences round-trip.");
-                File.WriteAllText(Path.Combine(directory, "ui-tests.txt"), checks + " UI checks passed.");
-                Shutdown(0);
-            }
-            catch (Exception ex)
-            {
-                File.WriteAllText(Path.Combine(directory, "ui-tests.txt"), "FAILED: " + ex);
-                Shutdown(1);
-            }
         }
     }
 }

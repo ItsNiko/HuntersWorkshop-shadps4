@@ -22,7 +22,3 @@ GPL-3.0. Copyright belongs to Noxde and the upstream contributors. Item names, d
 ## Artwork
 
 `assets/emblem.png`, `assets/workshop.png` and the derived multi-size `assets/HuntersWorkshop.ico` are original AI-generated app artwork. They contain no extracted game assets. See ASSETS.md. They are provided with this GPL project to the extent copyright applies.
-
-## Development dependencies
-
-The application has no bundled third-party runtime package. Development bridge tests optionally use Unicorn 2.1.4 (GPL-2.0, installed separately through pip). Python, Windows, .NET Framework and GitHub Actions retain their respective licenses and are not redistributed in the release ZIP.

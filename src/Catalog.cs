@@ -23,7 +23,6 @@ namespace HuntersWorkshop {
         public override string ToString() { return Label; }
     }
     public sealed class GemSource { public int Id,Flags; }
-    public sealed class Profile { public string[] ExeHashes; public string Version; }
     public sealed class Catalog {
         public Item[] Items; public GemEffect[] Effects; public GemSource[] Gems; public int[] WeaponRows;
         public string GameSourceHash;
