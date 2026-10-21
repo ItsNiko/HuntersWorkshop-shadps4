@@ -107,6 +107,11 @@ namespace HuntersWorkshop {
             }
             throw new InvalidOperationException("Bloodborne's 1.09 image is not ready or does not match. Finish starting the game and try again.");
         }
+        void Dump(string name,long at,byte[] expected,bool verified) {
+            try { string have=BitConverter.ToString(m.Read(at,40)).Replace("-"," "),want=BitConverter.ToString(expected).Replace("-"," ");
+                Log("check "+name+" rva=0x"+(at-image).ToString("X")+" ok="+verified+"\n   expected "+want+"\n   actual   "+have); }
+            catch(Exception ex) { Log("check "+name+" unreadable: "+ex.Message); }
+        }
         public void Connect(int specificPid=0) {
             if(Connected) return;
             Dispose();
@@ -139,6 +144,12 @@ namespace HuntersWorkshop {
             if(!ownsSession) { sessionLock.Dispose(); sessionLock=null; throw new InvalidOperationException("Another Hunter's Workshop is already connected."); }
             try {
                 m=new Memory(p); image=IsShadPs4?FindShadImage():FindImage();
+                if(IsShadPs4) {
+                    Dump("Tick",image+Commands.Tick,tickPro,VerifiedFunction(image+Commands.Tick,tickPro));
+                    Dump("GiveList",image+Commands.GiveList,listPro,VerifiedFunction(image+Commands.GiveList,listPro));
+                    Dump("Release",image+Commands.Release,releasePro,Match(image+Commands.Release,releasePro));
+                    Dump("SaveRequest",image+Commands.SaveRequest,savePro,Match(image+Commands.SaveRequest,savePro));
+                }
                 if(!VerifiedFunction(image+Commands.Tick,tickPro) || !VerifiedFunction(image+Commands.GiveList,listPro) || !Match(image+Commands.Release,releasePro) || !Match(image+Commands.SaveRequest,savePro))
                     throw new InvalidOperationException("A required function is changed. This build cannot be attached safely.");
                 site=image+Commands.Tick; byte[] first=m.Read(site,tickPro.Length); long resume; byte[] displaced;
