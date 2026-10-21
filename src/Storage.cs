@@ -140,7 +140,7 @@ namespace HuntersWorkshop
                 foreach (string file in Walk(root))
                 {
                     // shadPS4 stores every game's saves together; keep only this title's.
-                    if (titleFilter != null && file.IndexOf(Path.DirectorySeparatorChar + titleFilter + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) < 0) continue;
+                    if (titleFilter != null && !titleFilter.Split('|').Any(t => file.IndexOf(Path.DirectorySeparatorChar + t + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase) >= 0)) continue;
                     yield return file;
                 }
             }

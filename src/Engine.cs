@@ -20,6 +20,8 @@ namespace HuntersWorkshop {
     public sealed class Engine : IDisposable {
         public const long ImageBase=0x800000000L;
         public const string TitleId="CUSA03173";
+        // Bloodborne saves are stored under the save-data title id of the disc/region, which is not always the 1.09 patch id.
+        public const string SaveTitles="CUSA00207|CUSA03173|CUSA00900|CUSA01363|CUSA00299";
 
         sealed class Fn {
             public readonly string Name; public readonly long At; public readonly byte[] Prologue;
@@ -49,7 +51,37 @@ namespace HuntersWorkshop {
         static string Hex(byte[] b) { return BitConverter.ToString(b).Replace("-"," "); }
         static bool Same(Memory mem,long at,byte[] expected) { try { return mem.Read(at,expected.Length).SequenceEqual(expected); } catch(Exception) { return false; } }
         bool Match(long at,byte[] expected) { return Same(m,at,expected); }
-        static bool IsGame(Memory mem,long img) { return Same(mem,img+Commands.Give,givePro) && Same(mem,img+Commands.Create,createPro); }
+        static bool IsGame(Memory mem,long img) { return Entry(mem,img+Commands.Give,givePro,null) && Entry(mem,img+Commands.Create,createPro,null); }
+
+        // A function the Workshop only CALLS may carry somebody else's entry detour (a patched eboot, the
+        // mod menu, a shadPS4 patch): 'jmp rel32' or 'jmp [rip+0]' over the first instruction(s), NOPs up to
+        // the next instruction boundary, and the rest of the prologue untouched. Calling through such a
+        // detour is safe, so it is accepted as long as the untouched tail still matches the 1.09 prologue.
+        // 'detour' is set to a description when one was recognised, null for the stock bytes.
+        internal static bool Accepts(long at,byte[] actual,byte[] expected,out string detour) {
+            detour=null;
+            if(actual.Length<expected.Length) return false;
+            if(actual.Take(expected.Length).SequenceEqual(expected)) return true;
+            int jump; long target;
+            if(actual[0]==0xe9) { jump=5; target=at+5+BitConverter.ToInt32(actual,1); }
+            else if(actual[0]==0xff && actual[1]==0x25 && actual[2]==0 && actual[3]==0 && actual[4]==0 && actual[5]==0 && expected.Length>=jump14+4) { jump=jump14; target=BitConverter.ToInt64(actual,6); }
+            else return false;
+            for(int n=jump;n<=expected.Length-4;n++) {
+                if(n>jump && actual[n-1]!=0x90 && actual[n-1]!=0xcc) break;
+                bool tail=true; for(int i=n;i<expected.Length;i++) if(actual[i]!=expected[i]) { tail=false; break; }
+                if(tail) { detour="jump to 0x"+target.ToString("X")+" over the first "+n+" bytes"; return true; }
+            }
+            return false;
+        }
+        const int jump14=14;
+        static bool Entry(Memory mem,long at,byte[] expected,Fn f) {
+            byte[] actual; try { actual=mem.Read(at,expected.Length); } catch(Exception) { return false; }
+            string detour; if(!Accepts(at,actual,expected,out detour)) return false;
+            if(detour!=null && f!=null) Log("check "+f.Name+" rva=0x"+f.At.ToString("X")+" accepted: entry is detoured by another tool ("+detour+"); the rest of the prologue matches 1.09");
+            return true;
+        }
+        // Tick is the one function the Workshop patches itself, so it must be stock (or our own stale hook).
+        bool Verify(Fn f) { return f.Name=="Tick" ? Match(image+f.At,f.Prologue) : Entry(m,image+f.At,f.Prologue,f); }
 
         // The real shadPS4 window process. The Qt launcher alone does not host the game.
         static List<Process> FindShadProcesses() {
@@ -153,10 +185,11 @@ namespace HuntersWorkshop {
             try {
                 m=new Memory(p); image=hosts[0].Value;
                 RemoveStaleHook();
-                var bad=required.Where(f=>!Match(image+f.At,f.Prologue)).ToList();
+                var bad=required.Where(f=>!Verify(f)).ToList();
                 if(bad.Count>0) {
                     foreach(Fn f in bad) Dump(f);
-                    throw new InvalidOperationException("These game functions do not match Bloodborne 1.09: "+String.Join(", ",bad.Select(f=>f.Name))+". Only the unmodified CUSA03173 1.09 eboot is supported. Details are in the activity log.");
+                    if(bad.Any(f=>f.Name=="Tick")) throw new InvalidOperationException("Another tool already hooks the game's per-frame Tick function, and the Workshop cannot share that one. Close the other tool or restart the game. Details are in the activity log.");
+                    throw new InvalidOperationException("These game functions do not match Bloodborne 1.09: "+String.Join(", ",bad.Select(f=>f.Name))+". Only entry detours on the called functions are tolerated; anything else in the code must be the stock CUSA03173 1.09 eboot. Details are in the activity log.");
                 }
                 site=image+Commands.Tick; original=m.Read(site,tickPro.Length);
                 block=m.Allocate(); data=block+4096;
@@ -230,7 +263,10 @@ namespace HuntersWorkshop {
                 Snapshot s=Inspect(); if(!s.Ready) throw new InvalidOperationException(s.Message);
                 int state=m.I(data); if(state==1 || state==2) throw new InvalidOperationException("A game command is still pending.");
                 // Take a complete verified snapshot once per session before the first persistent action.
-                if(LastBackup==null || backedUpCharacter!=s.Pgd) { LastBackup=Backup(); backedUpCharacter=s.Pgd; }
+                if(LastBackup==null || backedUpCharacter!=s.Pgd) {
+                    try { LastBackup=Backup(); } catch(IOException ex) { throw new IOException("Nothing was granted: the safety backup of your save could not be made. "+ex.Message,ex); }
+                    backedUpCharacter=s.Pgd;
+                }
                 var before=Inventory(s); int fullId=id|(category<<28);
                 long oldCount=before.Where(x=>x[1]==fullId).Sum(x=>(long)x[2]);
                 byte[] packet=Commands.Packet(s.Pgd,s.Player,kind,id,category,count,flags,shape,effects);
@@ -271,9 +307,39 @@ namespace HuntersWorkshop {
         // uses a "user" folder beside the executable; otherwise it lives in %APPDATA%\shadPS4.
         public static string ShadUserDirectory(string emulatorFolder) {
             var options=new List<string>();
-            if(!String.IsNullOrWhiteSpace(emulatorFolder)) options.Add(Path.Combine(emulatorFolder,"user"));
+            if(!String.IsNullOrWhiteSpace(emulatorFolder)) {
+                string trimmed=emulatorFolder.TrimEnd(Path.DirectorySeparatorChar,Path.AltDirectorySeparatorChar);
+                options.Add(Path.Combine(trimmed,"user"));
+                string parent=null; try { parent=Path.GetDirectoryName(trimmed); } catch(ArgumentException) { }
+                if(!String.IsNullOrEmpty(parent)) options.Add(Path.Combine(parent,"user"));
+            }
             options.Add(Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),"shadPS4","user"));
             foreach(string o in options) if(Directory.Exists(Path.Combine(o,"savedata"))) return Path.GetFullPath(o);
+            // Custom layouts (bundled or renamed folders): look a few levels around the emulator for the
+            // folder that holds savedata\<user>\CUSA03173.
+            if(!String.IsNullOrWhiteSpace(emulatorFolder)) {
+                string trimmed=emulatorFolder.TrimEnd(Path.DirectorySeparatorChar,Path.AltDirectorySeparatorChar), parent=null;
+                try { parent=Path.GetDirectoryName(trimmed); } catch(ArgumentException) { }
+                foreach(string root in new[]{trimmed,parent,Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),"shadPS4")}) {
+                    if(String.IsNullOrEmpty(root)) continue;
+                    string found=FindSaveRoot(root,3); if(found!=null) { Log("Found the Bloodborne save folder at "+found); return Path.GetFullPath(found); }
+                }
+            }
+            return null;
+        }
+        static string FindSaveRoot(string dir,int depth) {
+            try {
+                if((File.GetAttributes(dir)&FileAttributes.ReparsePoint)!=0) return null;
+                string saves=Path.Combine(dir,"savedata");
+                if(Directory.Exists(saves)) {
+                    foreach(string t in SaveTitles.Split('|')) {
+                        if(Directory.Exists(Path.Combine(saves,t))) return dir;
+                        foreach(string u in Directory.GetDirectories(saves)) if(Directory.Exists(Path.Combine(u,t))) return dir;
+                    }
+                }
+                if(depth<=0) return null;
+                foreach(string sub in Directory.GetDirectories(dir)) { string r=FindSaveRoot(sub,depth-1); if(r!=null) return r; }
+            } catch(IOException) { } catch(UnauthorizedAccessException) { }
             return null;
         }
         public void SetFolder(string directory) {
@@ -288,7 +354,7 @@ namespace HuntersWorkshop {
                 if(String.IsNullOrWhiteSpace(ShadPath)) throw new IOException("Choose your shadPS4 folder in Session, or connect to the game first.");
                 user=ShadUserDirectory(ShadPath) ?? Path.Combine(ShadPath,"user");
             }
-            return SaveBackup.Create(user,Storage.Backups,TitleId);
+            return SaveBackup.Create(user,Storage.Backups,SaveTitles);
         }
         public void Dispose() {
             if(actions.CurrentCount==0) throw new InvalidOperationException("Wait for the current grant to finish before disconnecting.");
