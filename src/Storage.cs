@@ -11,7 +11,7 @@ namespace HuntersWorkshop
 {
     public sealed class Preferences
     {
-        public string PortDirectory { get; set; }
+        public string ShadDirectory { get; set; }
         public string UserDirectory { get; set; }
         public List<string> Favorites { get; set; }
         public List<Recipe> Recipes { get; set; }
@@ -133,7 +133,7 @@ namespace HuntersWorkshop
     {
         public static IEnumerable<string> ListFiles(string user, string titleFilter = null)
         {
-            foreach (string group in new[] { "savedata", "savedata_party" })
+            foreach (string group in new[] { "savedata" })
             {
                 string root = Path.Combine(user, group);
                 if (!Directory.Exists(root)) continue;
@@ -152,7 +152,6 @@ namespace HuntersWorkshop
                 throw new IOException("Save backups do not follow symbolic links or junctions. Select the real user folder.");
             foreach (string file in Directory.GetFiles(path).OrderBy(p => p, StringComparer.OrdinalIgnoreCase))
             {
-                if (file.EndsWith(".bbtmp", StringComparison.OrdinalIgnoreCase)) continue;
                 if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)
                     throw new IOException("A save file is a link. Select the real save folder.");
                 yield return file;
@@ -164,7 +163,7 @@ namespace HuntersWorkshop
         public static string Create(string user, string destinationRoot, string titleFilter = null)
         {
             if (String.IsNullOrWhiteSpace(user) || !Directory.Exists(user))
-                throw new IOException("Choose your native port or shadPS4 folder in Session, or connect to the running game first.");
+                throw new IOException("Choose your shadPS4 folder in Session, or connect to the running game first.");
             user = Path.GetFullPath(user).TrimEnd(Path.DirectorySeparatorChar);
             destinationRoot = Path.GetFullPath(destinationRoot).TrimEnd(Path.DirectorySeparatorChar);
             if (destinationRoot.Equals(user, StringComparison.OrdinalIgnoreCase) ||
@@ -172,7 +171,7 @@ namespace HuntersWorkshop
                 throw new IOException("The backup destination must be outside the game's user folder.");
 
             string[] files = ListFiles(user, titleFilter).OrderBy(x => x, StringComparer.OrdinalIgnoreCase).ToArray();
-            if (files.Length == 0) throw new IOException("No saves were found. Check the port folder in Session, or load and save a character first.");
+            if (files.Length == 0) throw new IOException("No saves were found. Check the shadPS4 folder in Session, or load and save a character first.");
             Directory.CreateDirectory(destinationRoot);
             string name = DateTime.Now.ToString("yyyyMMdd-HHmmss-fff") + "-" + Guid.NewGuid().ToString("N").Substring(0, 6);
             string staging = Path.Combine(destinationRoot, name + ".partial");

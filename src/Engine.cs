@@ -1,82 +1,86 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
-using System.Security.Cryptography;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Web.Script.Serialization;
 
 namespace HuntersWorkshop {
     public sealed class Snapshot { public long Pgd,Player; public int Hp,Level; public bool Ready; public string Message; }
+
+    // Attaches to shadPS4 and runs game calls (item and gem grants) on the game's main thread.
+    //
+    // shadPS4 executes the PS4 eboot natively, so the game's code and data live inside the
+    // shadPS4.exe process, and the Bloodborne 1.09 eboot is always mapped at 0x800000000 (this is how
+    // the working Bloodborne mod menu finds it too). Every offset in Commands.cs is relative to that
+    // base. The image is confirmed by comparing function prologues before anything is written.
     public sealed class Engine : IDisposable {
-        readonly Profile profile; readonly Catalog catalog; Memory m; long image,block,data,site; byte[] original,patch;
-        Semaphore sessionLock; bool ownsSession,faulted,hookInstalled; long backedUpCharacter; readonly SemaphoreSlim actions=new SemaphoreSlim(1,1);
-        public bool Connected { get { try { return m!=null && !m.Process.HasExited; } catch(InvalidOperationException) { return false; } } }
-        public int Pid { get { return Connected?m.Process.Id:0; } }
-        public string PortPath { get; private set; }
-        public string LastBackup { get; private set; }
-        public string UserPath { get; set; }
-        // True when attached to a shadPS4 emulator process instead of the native bbport build.
-        public bool IsShadPs4 { get; private set; }
-        public string TargetName { get { return IsShadPs4 ? "shadPS4" : "bbport"; } }
-        public const string ShadTitleId = "CUSA03173";
-        static readonly string[] ShadProcessNames = { "shadPS4", "shadPS4QtLauncher" };
+        public const long ImageBase=0x800000000L;
+        public const string TitleId="CUSA03173";
+
+        sealed class Fn {
+            public readonly string Name; public readonly long At; public readonly byte[] Prologue;
+            public Fn(string name,long at,byte[] prologue) { Name=name; At=at; Prologue=prologue; }
+        }
         static readonly byte[] givePro={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x68};
         static readonly byte[] createPro={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x28};
         static readonly byte[] releasePro={0x55,0x48,0x89,0xe5,0x41,0x56,0x53,0x48,0x89,0xfb,0x8b,0x33};
         static readonly byte[] listPro={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53};
         static readonly byte[] tickPro={0x55,0x48,0x89,0xe5,0x41,0x57,0x41,0x56,0x41,0x55,0x41,0x54,0x53,0x48,0x83,0xec,0x38};
         static readonly byte[] savePro={0x55,0x48,0x89,0xe5,0x48,0x8d,0x05,0x1d,0x43,0x20,0x04,0x48,0x83,0x38,0x00,0x75};
-        public Engine(Profile p,Catalog c) { profile=p; catalog=c; PortPath=Storage.Load().PortDirectory; }
-        public static string Hash(string file) { using(var s=File.OpenRead(file)) using(var h=SHA256.Create()) return BitConverter.ToString(h.ComputeHash(s)).Replace("-","").ToLowerInvariant(); }
-        public static string BaseDir { get { return AppDomain.CurrentDomain.BaseDirectory; } }
+        static readonly Fn[] required={
+            new Fn("Give",Commands.Give,givePro), new Fn("Create",Commands.Create,createPro), new Fn("Tick",Commands.Tick,tickPro),
+            new Fn("GiveList",Commands.GiveList,listPro), new Fn("Release",Commands.Release,releasePro), new Fn("SaveRequest",Commands.SaveRequest,savePro) };
+
+        readonly Catalog catalog; Memory m; long image,block,data,site; byte[] original,patch;
+        Semaphore sessionLock; bool ownsSession,faulted,hookInstalled; long backedUpCharacter; string lastStatus;
+        readonly SemaphoreSlim actions=new SemaphoreSlim(1,1);
+
+        public Engine(Catalog c) { catalog=c; ShadPath=Storage.Load().ShadDirectory; }
+        public bool Connected { get { try { return m!=null && !m.Host.HasExited; } catch(InvalidOperationException) { return false; } } }
+        public string ShadPath { get; private set; }
+        public string LastBackup { get; private set; }
+        public string UserPath { get; set; }
         public static void Log(string s) { Storage.Log(s); }
-        bool Match(long at,byte[] expected) { try { return m.Read(at,expected.Length).SequenceEqual(expected); } catch { return false; } }
-        // Accept only this byte-verified port's own prehandler trampoline, including its exact
-        // displaced prologue and branch back. Arbitrary third-party detours are refused.
-        bool VerifiedFunction(long at,byte[] prologue) {
-            if(Match(at,prologue)) return true;
-            try {
-                byte[] entry=m.Read(at,5); if(entry[0]!=0xe9) return false;
-                long target=at+5+BitConverter.ToInt32(entry,1);
-                if(Math.Abs(target-at)>0x70000000) return false;
-                byte[] b=m.Read(target,700);
-                for(int i=0;i<b.Length-prologue.Length-5;i++) {
-                    bool same=true; for(int k=0;k<prologue.Length;k++) if(b[i+k]!=prologue[k]) { same=false; break; }
-                    int j=i+prologue.Length;
-                    if(same && b[j]==0xe9 && target+j+5+BitConverter.ToInt32(b,j+1)==at+prologue.Length) return true;
-                }
-            } catch { }
-            return false;
+
+        static string Hex(byte[] b) { return BitConverter.ToString(b).Replace("-"," "); }
+        static bool Same(Memory mem,long at,byte[] expected) { try { return mem.Read(at,expected.Length).SequenceEqual(expected); } catch(Exception) { return false; } }
+        bool Match(long at,byte[] expected) { return Same(m,at,expected); }
+        static bool IsGame(Memory mem,long img) { return Same(mem,img+Commands.Give,givePro) && Same(mem,img+Commands.Create,createPro); }
+
+        // The real shadPS4 window process. The Qt launcher alone does not host the game.
+        static List<Process> FindShadProcesses() {
+            var found=new List<Process>();
+            foreach(Process p in Process.GetProcesses()) {
+                bool keep=false;
+                try { keep=p.ProcessName.StartsWith("shadPS4",StringComparison.OrdinalIgnoreCase) && p.ProcessName.IndexOf("Launcher",StringComparison.OrdinalIgnoreCase)<0; }
+                catch(Exception) { }
+                if(keep) found.Add(p); else p.Dispose();
+            }
+            return found;
         }
-        // shadPS4 maps the guest address space itself (not as a private image allocation), so
-        // locate the eboot by finding the verified Give prologue and checking Create at its fixed
-        // distance. Both functions come from the same decrypted 1.09 executable.
-        long scanBytes,scanHits,scanRegions,scanReadFails;
-        long ScanForImage(bool executableOnly) {
-            scanBytes=0; scanHits=0; scanRegions=0; scanReadFails=0;
-            long at=0x10000; byte[] needle=givePro; const int chunk=1024*1024;
+
+        // Fixed base first. The scan is only a safety net for a shadPS4 build that maps the eboot
+        // somewhere else: it looks for Give's prologue in executable memory.
+        static long Locate(Memory mem) {
+            if(IsGame(mem,ImageBase)) return ImageBase;
+            const int chunk=1024*1024; long at=0x10000;
             while(at<0x7ffffffeffff) {
                 Native.Region r;
-                if(Native.VirtualQueryEx(m.Handle,new IntPtr(at),out r,(UIntPtr)48)==UIntPtr.Zero || r.Size==0) break;
+                if(Native.VirtualQueryEx(mem.Handle,new IntPtr(at),out r,(UIntPtr)48)==UIntPtr.Zero || r.Size==0) break;
                 bool readable=r.State==0x1000 && (r.Protect&0x101)==0 && r.Protect!=0;
-                bool exec=(r.Protect&0xf0)!=0;
-                if(readable && (exec || !executableOnly) && r.Size>=0x10000 && r.Size<=(executableOnly?0x80000000UL:0x10000000UL)) {
-                    long start=r.Base,end=r.Base+(long)r.Size; scanRegions++;
-                    for(long off=start;off<end;off+=chunk-needle.Length) {
-                        int n=(int)Math.Min(chunk,end-off); if(n<needle.Length) break;
-                        byte[] buf; try { buf=m.Read(off,n); } catch { scanReadFails++; break; }
-                        scanBytes+=n;
+                if(readable && (r.Protect&0xf0)!=0 && r.Size>=0x10000 && r.Size<=0x80000000UL) {
+                    long end=r.Base+(long)r.Size;
+                    for(long off=r.Base;off<end;off+=chunk-givePro.Length) {
+                        int n=(int)Math.Min(chunk,end-off); if(n<givePro.Length) break;
+                        byte[] buf; try { buf=mem.Read(off,n); } catch(Exception) { break; }
                         int i=0;
-                        while((i=Array.IndexOf(buf,needle[0],i))>=0 && i<=buf.Length-needle.Length) {
-                            bool same=true; for(int k=1;k<needle.Length;k++) if(buf[i+k]!=needle[k]) { same=false; break; }
-                            if(same) {
-                                scanHits++; long candidate=off+i-Commands.Give;
-                                if(candidate>0x10000 && Match(candidate+Commands.Create,createPro)) return candidate;
-                            }
+                        while((i=Array.IndexOf(buf,givePro[0],i))>=0 && i<=buf.Length-givePro.Length) {
+                            bool same=true; for(int k=1;k<givePro.Length;k++) if(buf[i+k]!=givePro[k]) { same=false; break; }
+                            if(same) { long candidate=off+i-Commands.Give; if(candidate>0x10000 && IsGame(mem,candidate)) return candidate; }
                             i++;
                         }
                     }
@@ -85,152 +89,112 @@ namespace HuntersWorkshop {
             }
             return 0;
         }
-        long FindShadImage() {
-            var clock=Stopwatch.StartNew();
-            long found=ScanForImage(true);
-            Log("shadPS4 scan pass 1 (executable): found="+(found!=0)+" regions="+scanRegions+" MB="+(scanBytes>>20)+" functionHits="+scanHits+" readFailures="+scanReadFails+" ms="+clock.ElapsedMilliseconds);
-            if(found==0) { found=ScanForImage(false); Log("shadPS4 scan pass 2 (all memory <=256MB regions): found="+(found!=0)+" regions="+scanRegions+" MB="+(scanBytes>>20)+" functionHits="+scanHits+" readFailures="+scanReadFails+" ms="+clock.ElapsedMilliseconds); }
-            if(found==0) Log("shadPS4 scan: no match. regions="+scanRegions+" MB="+(scanBytes>>20)+" givePrologueHits="+scanHits+" readFailures="+scanReadFails);
-            if(found==0) throw new InvalidOperationException("Bloodborne CUSA03173 1.09 was not found in shadPS4 (scanned "+(scanBytes>>20)+" MB, "+scanHits+" function hits). Start the game, wait for the title screen, and try again. Only CUSA03173 v01.09 is supported.");
-            return found;
+
+        static string Explain(Memory mem) {
+            long at=ImageBase+Commands.Give; string have;
+            try { have=Hex(mem.Read(at,givePro.Length)); } catch(Exception) { have="unreadable"; }
+            Log("Bloodborne not found: bytes at 0x"+at.ToString("X")+" are "+have+"; expected "+Hex(givePro));
+            return have=="unreadable" ? "The game is not loaded yet. Start Bloodborne and wait for the title screen." : "The game code does not match the 1.09 eboot (see the activity log).";
         }
-        long FindImage() {
-            long at=0x10000; var seen=new HashSet<long>();
-            while(at<0x7ffffffeffff) {
-                Native.Region r;
-                if(Native.VirtualQueryEx(m.Handle,new IntPtr(at),out r,(UIntPtr)48)==UIntPtr.Zero || r.Size==0) break;
-                if(r.State==0x1000 && r.Type==0x20000 && (r.Protect&0xf0)!=0 && r.AllocationBase>0x10000 && seen.Add(r.AllocationBase)) {
-                    long candidate=r.AllocationBase;
-                    if(Match(candidate+Commands.Give,givePro) && Match(candidate+Commands.Create,createPro)) return candidate;
-                }
-                long next=r.Base+(long)r.Size; if(next<=at) break; at=next;
-            }
-            throw new InvalidOperationException("Bloodborne's 1.09 image is not ready or does not match. Finish starting the game and try again.");
+
+        void Dump(Fn f) {
+            try { Log("check "+f.Name+" rva=0x"+f.At.ToString("X")+" FAILED\n   expected "+Hex(f.Prologue)+"\n   actual   "+Hex(m.Read(image+f.At,f.Prologue.Length))); }
+            catch(Exception ex) { Log("check "+f.Name+" unreadable: "+ex.Message); }
         }
-        List<long> FindAll(byte[] needle,int max) {
-            var found=new List<long>(); long at=0x10000; const int chunk=1024*1024;
-            while(at<0x7ffffffeffff && found.Count<max) {
-                Native.Region r;
-                if(Native.VirtualQueryEx(m.Handle,new IntPtr(at),out r,(UIntPtr)48)==UIntPtr.Zero || r.Size==0) break;
-                if(r.State==0x1000 && (r.Protect&0x101)==0 && r.Protect!=0 && (r.Protect&0xf0)!=0 && r.Size>=0x10000 && r.Size<=0x80000000UL) {
-                    long end=r.Base+(long)r.Size;
-                    for(long off=r.Base;off<end && found.Count<max;off+=chunk-needle.Length) {
-                        int n=(int)Math.Min(chunk,end-off); if(n<needle.Length) break;
-                        byte[] buf; try { buf=m.Read(off,n); } catch { break; }
-                        int i=0;
-                        while(found.Count<max && (i=Array.IndexOf(buf,needle[0],i))>=0 && i<=buf.Length-needle.Length) {
-                            bool same=true; for(int k=1;k<needle.Length;k++) if(buf[i+k]!=needle[k]) { same=false; break; }
-                            if(same) found.Add(off+i);
-                            i++;
-                        }
-                    }
-                }
-                long next=r.Base+(long)r.Size; if(next<=at) break; at=next;
-            }
-            return found;
+
+        // A Workshop that was killed instead of disconnected leaves its jump at Tick. When that jump
+        // provably leads to one of our own bridges, put the original prologue back so the next
+        // session starts clean instead of demanding a game restart.
+        void RemoveStaleHook() {
+            long at=image+Commands.Tick; byte[] now;
+            try { now=m.Read(at,tickPro.Length); } catch(Exception) { return; }
+            if(now.SequenceEqual(tickPro)) return;
+            if(now[0]!=0xff || now[1]!=0x25 || now[2]!=0 || now[3]!=0 || now[4]!=0 || now[5]!=0) return;
+            for(int i=14;i<now.Length;i++) if(now[i]!=0x90) return;
+            long target=BitConverter.ToInt64(now,6);
+            int length=Commands.Bridge(image,0,at+tickPro.Length,tickPro).Length;
+            var tail=new List<byte>(tickPro); tail.AddRange(new byte[]{0xff,0x25,0,0,0,0}); tail.AddRange(BitConverter.GetBytes(at+tickPro.Length));
+            byte[] have;
+            try { have=m.Read(target+length-tail.Count,tail.Count); } catch(Exception) { return; }
+            if(!have.SequenceEqual(tail)) return;
+            m.PausedPatch(at,now,tickPro);
+            Log("Removed the command hook left behind by an earlier Workshop session.");
         }
-        // Report where each expected function prologue really sits, relative to the expected offset.
-        void Diagnose() {
-            try {
-                Log("diagnose: image=0x"+image.ToString("X"));
-                long at=0x10000;
-                while(at<0x7ffffffeffff) {
-                    Native.Region r;
-                    if(Native.VirtualQueryEx(m.Handle,new IntPtr(at),out r,(UIntPtr)48)==UIntPtr.Zero || r.Size==0) break;
-                    if(r.State==0x1000 && (r.Protect&0xf0)!=0 && r.Size>=0x10000) Log("diagnose: exec region base-image=0x"+(r.Base-image).ToString("X")+" size=0x"+((long)r.Size).ToString("X")+" protect=0x"+r.Protect.ToString("X"));
-                    long next=r.Base+(long)r.Size; if(next<=at) break; at=next;
-                }
-                var items=new[] {
-                    new { N="Give",P=givePro,E=Commands.Give }, new { N="Create",P=createPro,E=Commands.Create },
-                    new { N="Tick",P=tickPro,E=Commands.Tick }, new { N="GiveList",P=listPro,E=Commands.GiveList },
-                    new { N="Release",P=releasePro,E=Commands.Release }, new { N="Save",P=savePro,E=Commands.SaveRequest } };
-                foreach(var it in items) {
-                    var hits=FindAll(it.P,4000);
-                    var near=hits.Select(h=>(h-image)-it.E).OrderBy(d=>Math.Abs(d)).Take(6).Select(d=>(d>=0?"+0x":"-0x")+Math.Abs(d).ToString("X"));
-                    Log("diagnose: "+it.N+" hits="+hits.Count+" nearest-delta: "+String.Join(", ",near));
-                }
-            } catch(Exception ex) { Log("diagnose failed: "+ex.Message); }
-        }
-        void Dump(string name,long at,byte[] expected,bool verified) {
-            try { string have=BitConverter.ToString(m.Read(at,40)).Replace("-"," "),want=BitConverter.ToString(expected).Replace("-"," ");
-                Log("check "+name+" rva=0x"+(at-image).ToString("X")+" ok="+verified+"\n   expected "+want+"\n   actual   "+have); }
-            catch(Exception ex) { Log("check "+name+" unreadable: "+ex.Message); }
-        }
-        public void Connect(int specificPid=0) {
+
+        public void Connect() {
             if(Connected) return;
             Dispose();
-            var candidates=Process.GetProcessesByName("bbport").Where(x=>specificPid==0 || x.Id==specificPid).ToArray();
-            Process p; string exe; IsShadPs4=false;
-            if(candidates.Length==0) {
-                // No native port is running: look for a shadPS4 emulator hosting the game.
-                var emu=ShadProcessNames.SelectMany(n=>Process.GetProcessesByName(n)).Where(x=>specificPid==0 || x.Id==specificPid).ToArray();
-                if(emu.Length==0) throw new InvalidOperationException("Start Bloodborne (native port or shadPS4), then connect.");
-                var hosts=new List<Process>(); bool denied=false; string diag="";
-                foreach(var e in emu) {
-                    try {
-                        using(var probe=new Memory(Process.GetProcessById(e.Id))) { var saved=m; m=probe; try { if(FindShadImage()!=0) hosts.Add(e); } catch(InvalidOperationException ex2) { diag=ex2.Message; } finally { m=saved; } }
-                    } catch(System.ComponentModel.Win32Exception ex) { Log("Cannot open shadPS4 PID "+e.Id+": "+ex.Message); denied=true; } catch(ArgumentException) { }
-                }
-                if(hosts.Count==0 && denied) throw new InvalidOperationException("Windows would not let the Workshop open shadPS4. Run both as the same user, or run the Workshop as administrator if shadPS4 is elevated.");
-                if(hosts.Count!=1) throw new InvalidOperationException(hosts.Count==0
-                    ? "shadPS4 is running but Bloodborne was not matched. "+diag
-                    : "Several shadPS4 instances are running Bloodborne. Close the extra instance first.");
-                p=hosts[0]; exe=p.MainModule.FileName; IsShadPs4=true;
-            } else {
-                if(candidates.Length!=1) throw new InvalidOperationException("Several Bloodborne processes are running. Close the extra instance first.");
-                p=candidates[0]; exe=p.MainModule.FileName;
-                if(!profile.ExeHashes.Contains(Hash(exe))) throw new InvalidOperationException("This port executable differs from the verified visy 0.6.7 / 0.6.8 builds. A compatibility update is needed.");
-            }
-            if(IsShadPs4) { PortPath=Path.GetDirectoryName(exe); UserPath=ShadUserDirectory(PortPath) ?? UserPath; }
-            else { PortPath=Directory.GetParent(Path.GetDirectoryName(exe)).FullName; UserPath=ProcessLaunch.UserDirectory(p.Id,PortPath) ?? UserPath; }
-            sessionLock=new Semaphore(1,1,"Local\\BloodborneHuntersWorkshop-"+p.Id);
-            ownsSession=sessionLock.WaitOne(0);
-            if(!ownsSession) { sessionLock.Dispose(); sessionLock=null; throw new InvalidOperationException("Another Hunter's Workshop is already connected."); }
+            var hosts=new List<KeyValuePair<int,long>>(); bool denied=false; string why="";
+            var emulators=FindShadProcesses(); int running=emulators.Count;
             try {
-                m=new Memory(p); image=IsShadPs4?FindShadImage():FindImage();
-                if(IsShadPs4) {
-                    Dump("Tick",image+Commands.Tick,tickPro,VerifiedFunction(image+Commands.Tick,tickPro));
-                    Dump("GiveList",image+Commands.GiveList,listPro,VerifiedFunction(image+Commands.GiveList,listPro));
-                    Dump("Release",image+Commands.Release,releasePro,Match(image+Commands.Release,releasePro));
-                    Dump("SaveRequest",image+Commands.SaveRequest,savePro,Match(image+Commands.SaveRequest,savePro));
-                    if(!VerifiedFunction(image+Commands.Tick,tickPro) || !VerifiedFunction(image+Commands.GiveList,listPro) || !Match(image+Commands.Release,releasePro) || !Match(image+Commands.SaveRequest,savePro)) Diagnose();
+                foreach(Process e in emulators) {
+                    try {
+                        using(var probe=new Memory(Process.GetProcessById(e.Id))) {
+                            long found=Locate(probe);
+                            if(found!=0) hosts.Add(new KeyValuePair<int,long>(e.Id,found)); else why=Explain(probe);
+                        }
+                    }
+                    catch(Win32Exception ex) { Log("Cannot open shadPS4 PID "+e.Id+": "+ex.Message); denied=true; }
+                    catch(ArgumentException) { }
                 }
-                if(!VerifiedFunction(image+Commands.Tick,tickPro) || !VerifiedFunction(image+Commands.GiveList,listPro) || !Match(image+Commands.Release,releasePro) || !Match(image+Commands.SaveRequest,savePro))
-                    throw new InvalidOperationException("A required function is changed. This build cannot be attached safely.");
-                site=image+Commands.Tick; byte[] first=m.Read(site,tickPro.Length); long resume; byte[] displaced;
-                if(first[0]==0xe9) {
-                    if(first.Skip(5).Any(b=>b!=0x90)) throw new InvalidOperationException("Unknown tick-hook padding; cannot install the command bridge.");
-                    original=first; resume=site+5+BitConverter.ToInt32(first,1); displaced=new byte[0];
+            } finally { foreach(Process e in emulators) e.Dispose(); }
+            if(running==0) throw new InvalidOperationException("Start shadPS4 (shadPS4.exe, not just the launcher) with Bloodborne, then connect.");
+            if(hosts.Count==0) throw new InvalidOperationException(denied
+                ? "Windows would not let the Workshop open shadPS4. Run both as the same user, or run the Workshop as administrator if shadPS4 is elevated."
+                : "shadPS4 is running but Bloodborne CUSA03173 1.09 was not found. "+why);
+            if(hosts.Count>1) throw new InvalidOperationException("Several shadPS4 instances are running Bloodborne. Close the extra instance first.");
+
+            int pid=hosts[0].Key; Process p=Process.GetProcessById(pid);
+            string exe=null; try { exe=p.MainModule.FileName; } catch(Exception) { }
+            if(exe!=null) { ShadPath=Path.GetDirectoryName(exe); UserPath=ShadUserDirectory(ShadPath) ?? UserPath; }
+            sessionLock=new Semaphore(1,1,"Local\\BloodborneHuntersWorkshop-"+pid);
+            ownsSession=sessionLock.WaitOne(0);
+            if(!ownsSession) { sessionLock.Dispose(); sessionLock=null; p.Dispose(); throw new InvalidOperationException("Another Hunter's Workshop is already connected."); }
+            try {
+                m=new Memory(p); image=hosts[0].Value;
+                RemoveStaleHook();
+                var bad=required.Where(f=>!Match(image+f.At,f.Prologue)).ToList();
+                if(bad.Count>0) {
+                    foreach(Fn f in bad) Dump(f);
+                    throw new InvalidOperationException("These game functions do not match Bloodborne 1.09: "+String.Join(", ",bad.Select(f=>f.Name))+". Only the unmodified CUSA03173 1.09 eboot is supported. Details are in the activity log.");
                 }
-                else { original=first; resume=site+first.Length; displaced=first; }
-                block=m.AllocateNear(site); data=block+4096;
-                byte[] bridge=Commands.Bridge(image,data,resume,displaced); if(bridge.Length>4096) throw new InvalidOperationException("Command bridge exceeds its code page.");
+                site=image+Commands.Tick; original=m.Read(site,tickPro.Length);
+                block=m.Allocate(); data=block+4096;
+                byte[] bridge=Commands.Bridge(image,data,site+original.Length,original); if(bridge.Length>4096) throw new InvalidOperationException("Command bridge exceeds its code page.");
                 m.Write(block,bridge); uint old;
                 if(!Native.VirtualProtectEx(m.Handle,new IntPtr(block),(UIntPtr)4096,0x20,out old) || !Native.FlushInstructionCache(m.Handle,new IntPtr(block),(UIntPtr)4096)) throw Native.Error("Cannot prepare command bridge");
                 patch=Enumerable.Repeat((byte)0x90,original.Length).ToArray();
                 patch[0]=0xff;patch[1]=0x25;for(int i=2;i<6;i++)patch[i]=0;
                 Buffer.BlockCopy(BitConverter.GetBytes(block),0,patch,6,8);
                 m.PausedPatch(site,original,patch); hookInstalled=true; faulted=false;
-                Log("Connected "+TargetName+" PID "+p.Id+" image 0x"+image.ToString("X")+"; main-thread bridge installed.");
+                Log("Connected shadPS4 PID "+pid+" image 0x"+image.ToString("X")+"; main-thread bridge at 0x"+block.ToString("X")+" installed.");
             } catch { Dispose(); throw; }
         }
+
+        Snapshot Say(Snapshot s,string message,string detail=null) {
+            s.Message=message;
+            string key=s.Ready?"ready":message;
+            if(key!=lastStatus) { lastStatus=key; Log("status: "+message+(detail==null?"":" ["+detail+"]")); }
+            return s;
+        }
         public Snapshot Inspect() {
-            var s=new Snapshot { Message="Not connected" };
-            if(!Connected) return s;
-            if(faulted) { s.Message="Command outcome uncertain — restart Bloodborne"; return s; }
+            var s=new Snapshot();
+            if(!Connected) return Say(s,"Not connected");
+            if(faulted) return Say(s,"Command outcome uncertain — restart Bloodborne");
             try {
                 long g=m.Q(image+Commands.Gdm),w=m.Q(image+Commands.World),f=m.Q(image+Commands.Flow);
-                if(g==0 || w==0 || f==0) { s.Message="Load a character"; return s; }
+                if(g==0 || w==0 || f==0) return Say(s,"Load a character","gdm/world/flow="+g.ToString("X")+"/"+w.ToString("X")+"/"+f.ToString("X"));
                 s.Pgd=m.Q(g+8); s.Player=m.Q(w+0x60);
-                if(s.Pgd==0 || s.Player==0) { s.Message="Load a character"; return s; }
-                if(m.Read(image+Commands.Loading,1)[0]!=0) { s.Message="Waiting for loading to finish"; return s; }
-                if(m.Read(f+0x1592,1)[0]!=1) { s.Message="Return to your own world before granting items"; return s; }
+                if(s.Pgd==0 || s.Player==0) return Say(s,"Load a character");
+                int loading=m.Read(image+Commands.Loading,1)[0];
+                if(loading!=0) return Say(s,"Waiting for loading to finish","loading="+loading);
+                int ownWorld=m.Read(f+0x1592,1)[0];
+                if(ownWorld!=1) return Say(s,"Return to your own world before granting items","flow+0x1592="+ownWorld);
                 long modules=m.Q(s.Player+0x3b0); long stats=modules==0?0:m.Q(modules+0x20);
                 s.Hp=stats==0?0:m.I(stats+0xf8); s.Level=m.I(s.Pgd+0x90);
-                if(s.Hp<=0) { s.Message="Waiting for a living character"; return s; }
-                s.Ready=true; s.Message="Hunter ready · level "+s.Level+" · HP "+s.Hp;
-            } catch { s.Message="Player data is unavailable — wait for loading"; }
-            return s;
+                if(s.Hp<=0) return Say(s,"Waiting for a living character","hp="+s.Hp);
+                s.Ready=true; return Say(s,"Hunter ready · level "+s.Level+" · HP "+s.Hp);
+            } catch(Exception ex) { return Say(s,"Player data is unavailable — wait for loading",ex.Message); }
         }
         public List<int[]> Inventory(Snapshot s) {
             long inv=s.Pgd+0x328; int split=m.I(inv+0x24),last=m.I(inv+0x88);
@@ -277,7 +241,11 @@ namespace HuntersWorkshop {
                     // Cancel an unclaimed packet while all game threads are suspended; never
                     // overwrite an executing status, retry, or free executable memory.
                     bool cancelled=m.CancelQueued(data);
-                    faulted=true; Log("TIMEOUT id="+id+" cancelled-before-execution="+cancelled+"; no retry; restart required.");
+                    Log("TIMEOUT id="+id+" cancelled-before-execution="+cancelled);
+                    // Unclaimed means the game never started it, so the outcome is certain. This is what
+                    // happens while shadPS4 is paused (F9) or the game is stalled on a loading screen.
+                    if(cancelled) throw new InvalidOperationException("The game did not pick up the command within 8 seconds, so nothing was granted. If shadPS4 is paused, resume the game and try again.");
+                    faulted=true;
                     throw new InvalidOperationException("The game did not confirm the command. Its outcome is uncertain. Restart Bloodborne and check your inventory before repeating it.");
                 }
                 int result=m.I(data+4);
@@ -298,6 +266,7 @@ namespace HuntersWorkshop {
                 return message;
             } finally { actions.Release(); }
         }
+
         // shadPS4 keeps PS4 saves under <user>\savedata\<userId>\CUSA03173. A portable install
         // uses a "user" folder beside the executable; otherwise it lives in %APPDATA%\shadPS4.
         public static string ShadUserDirectory(string emulatorFolder) {
@@ -307,29 +276,24 @@ namespace HuntersWorkshop {
             foreach(string o in options) if(Directory.Exists(Path.Combine(o,"savedata"))) return Path.GetFullPath(o);
             return null;
         }
-        public void ConfigurePort(string directory, string userDirectory = null) {
-            if(Connected) throw new InvalidOperationException("Disconnect before changing the port folder.");
-            if(String.IsNullOrWhiteSpace(directory)) throw new IOException("Select the native port folder or the shadPS4 folder.");
-            if(File.Exists(Path.Combine(directory,"out","bbport.exe"))) {
-                IsShadPs4=false; PortPath=Path.GetFullPath(directory);
-                UserPath=String.IsNullOrWhiteSpace(userDirectory)?null:Path.GetFullPath(userDirectory);
-            } else if(File.Exists(Path.Combine(directory,"shadPS4.exe")) || File.Exists(Path.Combine(directory,"shadPS4QtLauncher.exe"))) {
-                IsShadPs4=true; PortPath=Path.GetFullPath(directory);
-                UserPath=String.IsNullOrWhiteSpace(userDirectory)?ShadUserDirectory(PortPath):Path.GetFullPath(userDirectory);
-            } else throw new IOException("Select the native port folder containing out\\bbport.exe, or the shadPS4 folder containing shadPS4.exe.");
+        public void SetFolder(string directory) {
+            if(Connected) throw new InvalidOperationException("Disconnect before changing the shadPS4 folder.");
+            if(String.IsNullOrWhiteSpace(directory) || !(File.Exists(Path.Combine(directory,"shadPS4.exe")) || File.Exists(Path.Combine(directory,"shadPS4QtLauncher.exe"))))
+                throw new IOException("Select the shadPS4 folder (the one containing shadPS4.exe).");
+            ShadPath=Path.GetFullPath(directory); UserPath=ShadUserDirectory(ShadPath);
         }
         public string Backup() {
             string user=UserPath;
             if(String.IsNullOrWhiteSpace(user)) {
-                if(String.IsNullOrWhiteSpace(PortPath)) throw new IOException("Choose your native port or shadPS4 folder in Session, or connect to the game first.");
-                user=IsShadPs4?(ShadUserDirectory(PortPath) ?? Path.Combine(PortPath,"user")):Path.Combine(PortPath,"user");
+                if(String.IsNullOrWhiteSpace(ShadPath)) throw new IOException("Choose your shadPS4 folder in Session, or connect to the game first.");
+                user=ShadUserDirectory(ShadPath) ?? Path.Combine(ShadPath,"user");
             }
-            return SaveBackup.Create(user,Storage.Backups,IsShadPs4?ShadTitleId:null);
+            return SaveBackup.Create(user,Storage.Backups,TitleId);
         }
         public void Dispose() {
             if(actions.CurrentCount==0) throw new InvalidOperationException("Wait for the current grant to finish before disconnecting.");
             if(m!=null) {
-                bool exited=m.Process.HasExited;
+                bool exited=m.Host.HasExited;
                 if(!exited && hookInstalled) {
                     if(!Match(site,patch)) throw new InvalidOperationException("Another tool changed the command hook. Close Bloodborne before disconnecting.");
                     // Keep the connection available for retry if safe removal fails.
@@ -338,7 +302,7 @@ namespace HuntersWorkshop {
                 }
                 if(!exited && !hookInstalled && block!=0 && patch==null) m.Free(block);
                 m.Dispose(); m=null; patch=null; original=null; block=0; data=0; site=0; image=0;
-                hookInstalled=false; faulted=false; LastBackup=null; backedUpCharacter=0;
+                hookInstalled=false; faulted=false; LastBackup=null; backedUpCharacter=0; lastStatus=null;
             }
             if(ownsSession) { sessionLock.Release(); ownsSession=false; }
             if(sessionLock!=null) { sessionLock.Dispose(); sessionLock=null; }
