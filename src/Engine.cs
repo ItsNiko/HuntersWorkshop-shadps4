@@ -107,6 +107,50 @@ namespace HuntersWorkshop {
             }
             throw new InvalidOperationException("Bloodborne's 1.09 image is not ready or does not match. Finish starting the game and try again.");
         }
+        List<long> FindAll(byte[] needle,int max) {
+            var found=new List<long>(); long at=0x10000; const int chunk=1024*1024;
+            while(at<0x7ffffffeffff && found.Count<max) {
+                Native.Region r;
+                if(Native.VirtualQueryEx(m.Handle,new IntPtr(at),out r,(UIntPtr)48)==UIntPtr.Zero || r.Size==0) break;
+                if(r.State==0x1000 && (r.Protect&0x101)==0 && r.Protect!=0 && (r.Protect&0xf0)!=0 && r.Size>=0x10000 && r.Size<=0x80000000UL) {
+                    long end=r.Base+(long)r.Size;
+                    for(long off=r.Base;off<end && found.Count<max;off+=chunk-needle.Length) {
+                        int n=(int)Math.Min(chunk,end-off); if(n<needle.Length) break;
+                        byte[] buf; try { buf=m.Read(off,n); } catch { break; }
+                        int i=0;
+                        while(found.Count<max && (i=Array.IndexOf(buf,needle[0],i))>=0 && i<=buf.Length-needle.Length) {
+                            bool same=true; for(int k=1;k<needle.Length;k++) if(buf[i+k]!=needle[k]) { same=false; break; }
+                            if(same) found.Add(off+i);
+                            i++;
+                        }
+                    }
+                }
+                long next=r.Base+(long)r.Size; if(next<=at) break; at=next;
+            }
+            return found;
+        }
+        // Report where each expected function prologue really sits, relative to the expected offset.
+        void Diagnose() {
+            try {
+                Log("diagnose: image=0x"+image.ToString("X"));
+                long at=0x10000;
+                while(at<0x7ffffffeffff) {
+                    Native.Region r;
+                    if(Native.VirtualQueryEx(m.Handle,new IntPtr(at),out r,(UIntPtr)48)==UIntPtr.Zero || r.Size==0) break;
+                    if(r.State==0x1000 && (r.Protect&0xf0)!=0 && r.Size>=0x10000) Log("diagnose: exec region base-image=0x"+(r.Base-image).ToString("X")+" size=0x"+((long)r.Size).ToString("X")+" protect=0x"+r.Protect.ToString("X"));
+                    long next=r.Base+(long)r.Size; if(next<=at) break; at=next;
+                }
+                var items=new[] {
+                    new { N="Give",P=givePro,E=Commands.Give }, new { N="Create",P=createPro,E=Commands.Create },
+                    new { N="Tick",P=tickPro,E=Commands.Tick }, new { N="GiveList",P=listPro,E=Commands.GiveList },
+                    new { N="Release",P=releasePro,E=Commands.Release }, new { N="Save",P=savePro,E=Commands.SaveRequest } };
+                foreach(var it in items) {
+                    var hits=FindAll(it.P,4000);
+                    var near=hits.Select(h=>(h-image)-it.E).OrderBy(d=>Math.Abs(d)).Take(6).Select(d=>(d>=0?"+0x":"-0x")+Math.Abs(d).ToString("X"));
+                    Log("diagnose: "+it.N+" hits="+hits.Count+" nearest-delta: "+String.Join(", ",near));
+                }
+            } catch(Exception ex) { Log("diagnose failed: "+ex.Message); }
+        }
         void Dump(string name,long at,byte[] expected,bool verified) {
             try { string have=BitConverter.ToString(m.Read(at,40)).Replace("-"," "),want=BitConverter.ToString(expected).Replace("-"," ");
                 Log("check "+name+" rva=0x"+(at-image).ToString("X")+" ok="+verified+"\n   expected "+want+"\n   actual   "+have); }
@@ -149,6 +193,7 @@ namespace HuntersWorkshop {
                     Dump("GiveList",image+Commands.GiveList,listPro,VerifiedFunction(image+Commands.GiveList,listPro));
                     Dump("Release",image+Commands.Release,releasePro,Match(image+Commands.Release,releasePro));
                     Dump("SaveRequest",image+Commands.SaveRequest,savePro,Match(image+Commands.SaveRequest,savePro));
+                    if(!VerifiedFunction(image+Commands.Tick,tickPro) || !VerifiedFunction(image+Commands.GiveList,listPro) || !Match(image+Commands.Release,releasePro) || !Match(image+Commands.SaveRequest,savePro)) Diagnose();
                 }
                 if(!VerifiedFunction(image+Commands.Tick,tickPro) || !VerifiedFunction(image+Commands.GiveList,listPro) || !Match(image+Commands.Release,releasePro) || !Match(image+Commands.SaveRequest,savePro))
                     throw new InvalidOperationException("A required function is changed. This build cannot be attached safely.");
