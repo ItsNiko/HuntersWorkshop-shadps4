@@ -348,6 +348,22 @@ namespace HuntersWorkshop {
                 throw new IOException("Select the shadPS4 folder (the one containing shadPS4.exe).");
             ShadPath=Path.GetFullPath(directory); UserPath=ShadUserDirectory(ShadPath);
         }
+        public static bool EmulatorRunning() {
+            var found=FindShadProcesses();
+            try { return found.Count>0; } finally { foreach(Process p in found) p.Dispose(); }
+        }
+        // Puts a snapshot back after backing up the current saves. The game must be closed: a running
+        // shadPS4 keeps its own copy of the save in memory and would write it over the restored files.
+        public string RestoreSnapshot(SnapshotInfo snapshot) {
+            if(Connected) throw new InvalidOperationException("Disconnect from the game first, then close shadPS4 completely before restoring.");
+            if(EmulatorRunning()) throw new InvalidOperationException("Close shadPS4 completely before restoring a snapshot. A running game would write its own save over the restored files.");
+            string user=UserPath;
+            if(String.IsNullOrWhiteSpace(user)) {
+                if(String.IsNullOrWhiteSpace(ShadPath)) throw new IOException("Choose your shadPS4 folder in Session first.");
+                user=ShadUserDirectory(ShadPath) ?? Path.Combine(ShadPath,"user");
+            }
+            return SaveBackup.Restore(snapshot,user,Storage.Backups,SaveTitles);
+        }
         public string Backup() {
             string user=UserPath;
             if(String.IsNullOrWhiteSpace(user)) {
